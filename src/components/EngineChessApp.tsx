@@ -2,199 +2,156 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Chess } from 'chess.js'
 
 export default function EngineChessApp({ wasmUrl = '/wasm/ffp.js' }) {
-  const [chess] = useState(() => new Chess())
-  const [selected, setSelected] = useState(null) // e.g. "e2"
-  const [log, setLog] = useState('')
-  const [depth, setDepth] = useState(6)
-  const [engineSide, setEngineSide] = useState('b') // 'w' or 'b'
-  const [engineReady, setEngineReady] = useState(false)
-  const [thinking, setThinking] = useState(false)
-  const workerRef = useRef(null)
+  const [chess] = useState(() => new Chess());
+  const [selected, setSelected] = useState(null);
+  const [log, setLog] = useState('');
+  const [depth, setDepth] = useState(6);
+  const [engineSide, setEngineSide] = useState('b');
+  const [engineReady, setEngineReady] = useState(false);
+  const [engineError, setEngineError] = useState(null);
+  const [thinking, setThinking] = useState(false);
+  const workerRef = useRef(null);
 
-  // Start the engine worker once
   useEffect(() => {
-    const code = `
-      let Module = null;
-      let outBuf = [];
-      function post(type, data) { postMessage({ type, ...data }); }
-
-      function normalizeInitPayload(payload) {
-        if (typeof payload === 'string') {
-          return { scriptUrl: payload, wasmBinaryUrl: undefined };
-        }
-        return payload || {};
-      }
-
-      async function init(payload) {
-        const { scriptUrl, wasmBinaryUrl } = normalizeInitPayload(payload);
-        try {
-          if (!scriptUrl) throw new Error('Missing engine script URL');
-          const createModule = (await import(scriptUrl)).default; // ES6 + MODULARIZE glue
-          Module = await createModule({
-            locateFile: (path) => {
-              if (path.endsWith('.wasm')) {
-                if (wasmBinaryUrl) return wasmBinaryUrl;
-                const jsUrl = new URL(scriptUrl, self.location.href);
-                return new URL(path.replace(/.js$/, '.wasm'), jsUrl).toString();
-              }
-              return path;
-            },
-            print: (txt) => { outBuf.push(String(txt)); post('print', { line: String(txt) }); },
-            printErr: (txt) => { outBuf.push(String(txt)); post('print', { line: String(txt) }); },
-          });
-          post('ready', {});
-        } catch (e) {
-          post('fatal', { error: String(e) + '\nIf this is a classic glue (no ES6), rebuild with -s EXPORT_ES6=1; or adjust worker to use importScripts.' });
-        }
-      }
-
-      function runArgs(args) {
-        outBuf.length = 0;
-        try {
-          Module.callMain(args);
-          const full = outBuf.join('\n');
-          post('done', { output: full });
-        } catch (e) {
-          post('fatal', { error: String(e) });
-        }
-      }
-
-      onmessage = (ev) => {
-        const msg = ev.data || {};
-        if (msg.type === 'init') return init({ scriptUrl: msg.scriptUrl, wasmBinaryUrl: msg.wasmBinaryUrl });
-        if (msg.type === 'run') return runArgs(msg.args || []);
-      };
-    `
-
-    const blob = new Blob([code], { type: 'text/javascript' })
-    const url = URL.createObjectURL(blob)
-    const worker = new Worker(url, { type: 'module' })
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore
-    workerRef.current = worker
+    setEngineReady(false);
+    setEngineError(null);
+    const worker = new Worker(new URL("../workers/engineWorker.ts", import.meta.url), { type: "module" });
+    workerRef.current = worker;
 
     worker.onmessage = (e) => {
       const { type, line, output, error } = e.data || {}
-      if (type === 'ready') setEngineReady(true)
-      if (type === 'print') setLog((s) => s + line + '\n')
+      if (type === "ready") {
+        setEngineReady(true);
+        setEngineError(null);
+      }
+      if (type === 'print') setLog((s) => s + line + '\n');
       if (type === 'done') {
-        setThinking(false)
-        setLog((s) => s + '\n[engine finished]\n')
+        setThinking(false);
+        setLog((s) => s + '\n[engine finished]\n');
         if (output) {
-          const best = parseBestMove(output)
-          if (best) applyEngineMove(best)
+          const best = parseBestMove(output);
+          if (best) applyEngineMove(best);
         }
       }
       if (type === 'fatal') {
-        setThinking(false)
+        setThinking(false);
+        setEngineReady(false);
+        setEngineError(error || "Engine failed to load");
         setLog((s) => s + '\n[FATAL] ' + error + '\n')
       }
-    }
+    };
 
-    // init
-    const scriptUrl = new URL(wasmUrl, window.location.origin)
-    const wasmBinaryUrl = new URL(scriptUrl)
-    wasmBinaryUrl.pathname = wasmBinaryUrl.pathname.replace(/\.js$/, '.wasm')
+    worker.onerror = (event) => {
+      setThinking(false);
+      setEngineReady(false);
+      setEngineError(event.message || "Engine worker error");
+      setLog((s) => s + `\n[worker-error] ${event.message || event.type}\n`);
+    };
+
+    worker.onmessageerror = () => {
+      setThinking(false);
+      setEngineReady(false);
+      setEngineError("Engine worker could not deserialize message");
+      setLog((s) => s + "\n[worker-error] Failed to deserialize message\n");
+    };
+
+    const scriptUrl = new URL(wasmUrl, window.location.origin);
+    const wasmBinaryUrl = new URL(scriptUrl);
+    wasmBinaryUrl.pathname = wasmBinaryUrl.pathname.replace(/\.js$/, '.wasm');
     worker.postMessage({
       type: 'init',
       scriptUrl: scriptUrl.toString(),
       wasmBinaryUrl: wasmBinaryUrl.toString(),
-    })
+    });
 
     return () => {
-      worker.terminate()
-      URL.revokeObjectURL(url)
+      worker.terminate();
+      URL.revokeObjectURL(url);
     }
-  }, [wasmUrl])
+  }, [wasmUrl]);
 
-  // Helpers
-  const boardRows = useMemo(() => chess.board(), [chess, chess.fen()])
-  const turn = chess.turn()
+  const boardRows = useMemo(() => chess.board(), [chess, chess.fen()]);
+  const turn = chess.turn();
+  const engineStatus = engineError ? "error" : engineReady ? "ready" : "loading…";
 
   function colorOf(piece) {
-    return piece?.color
+    return piece?.color;
   }
 
   function uciFromSANorUci(str) {
-    // Already UCI? a2a4, e7e8q, etc.
-    if (/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(str)) return str
-    return null // keep simple; your engine outputs UCI according to spec
+    if (/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(str)) return str;
+    return null;
   }
 
   function parseBestMove(all) {
-    // Try to find a 'bestmove e2e4' line anywhere
-    const m = all.match(/bestmove\s+([a-h][1-8][a-h][1-8][qrbn]?)/i)
-    return m ? m[1].toLowerCase() : null
+    const m = all.match(/bestmove\s+([a-h][1-8][a-h][1-8][qrbn]?)/i);
+    return m ? m[1].toLowerCase() : null;
   }
 
   function coordToUci(fromSq, toSq, promo) {
-    return `${'' + fromSq}${'' + toSq}${promo ?? ''}`
+    return `${'' + fromSq}${'' + toSq}${promo ?? ''}`;
   }
 
   function applyEngineMove(uci) {
     try {
-      const from = uci.slice(0, 2)
-      const to = uci.slice(2, 4)
-      const promo = uci[4]
-      const moveObj = { from, to }
-      if (promo) moveObj.promotion = promo
-      const mv = chess.move(moveObj)
+      const from = uci.slice(0, 2);
+      const to = uci.slice(2, 4);
+      const promo = uci[4];
+      const moveObj = { from, to };
+      if (promo) moveObj.promotion = promo;
+      const mv = chess.move(moveObj);
       if (!mv) {
         setLog(
           (s) => s + `[warn] Engine move illegal in current position: ${uci}\n`,
-        )
-        return
+        );
+        return;
       }
-      forceRerender()
+      forceRerender();
     } catch (e) {
-      setLog((s) => s + `[error] Failed to apply engine move: ${String(e)}\n`)
+      setLog((s) => s + `[error] Failed to apply engine move: ${String(e)}\n`);
     }
   }
 
-  const [, setTick] = useState(0)
-  const forceRerender = () => setTick((n) => n + 1)
+  const [, setTick] = useState(0);
+  const forceRerender = () => setTick((n) => n + 1);
 
   function requestEngineMove() {
-    if (!engineReady || thinking) return
-    setThinking(true)
-    setLog('')
-    const fen = chess.fen()
-    const args = ['--fen', fen, '--search', String(depth)]
-    workerRef.current?.postMessage({ type: 'run', args })
+    if (!engineReady || thinking) return;
+    setThinking(true);
+    setLog('');
+    const fen = chess.fen();
+    const args = ['--fen', fen, '--search', String(depth)];
+    workerRef.current?.postMessage({ type: 'run', args });
   }
 
-  // When it's the engine's turn after your move, think automatically
   useEffect(() => {
-    const sideToMove = chess.turn()
+    const sideToMove = chess.turn();
     if (engineReady && sideToMove === engineSide && !thinking) {
-      requestEngineMove()
+      requestEngineMove();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chess.fen(), engineReady, engineSide])
+  }, [chess.fen(), engineReady, engineSide]);
 
   function onSquareClick(file, rank) {
-    const sq = toSquare(file, rank) // like "e2"
-    const piece = chess.get(sq)
+    const sq = toSquare(file, rank);
+    const piece = chess.get(sq);
 
     if (selected) {
       // Try move
-      const from = selected
-      const to = sq
-      const legalMoves = chess.moves({ square: from, verbose: true }) || []
-      const match = legalMoves.find((m) => m.to === to)
+      const from = selected;
+      const to = sq;
+      const legalMoves = chess.moves({ square: from, verbose: true }) || [];
+      const match = legalMoves.find((m) => m.to === to);
       if (match) {
-        const promotion = match.promotion || (match.flags.includes('p') && 'q')
+        const promotion = match.promotion || (match.flags.includes('p') && 'q');
         try {
-          chess.move({ from, to, promotion })
-          setSelected(null)
-          forceRerender()
-          return // useEffect above will trigger engine if it's engine's turn
+          chess.move({ from, to, promotion });
+          setSelected(null);
+          forceRerender();
+          return;
         } catch {}
       }
-      // Deselect if invalid or clicked same square
       setSelected(piece ? sq : null)
     } else {
-      // Select if your piece (human side)
       const humanSide = engineSide === 'w' ? 'b' : 'w'
       if (piece && piece.color === humanSide && chess.turn() === humanSide) {
         setSelected(sq)
@@ -254,9 +211,13 @@ export default function EngineChessApp({ wasmUrl = '/wasm/ffp.js' }) {
         {/* Side panel */}
         <div className="flex-1">
           <div className="mb-2 text-sm text-slate-600">
-            Engine: <b>{engineReady ? 'ready' : 'loading…'}</b> | Side:{' '}
-            {engineSide === 'w' ? 'Engine = White' : 'Engine = Black'}
+            Engine: <b className={engineError ? "text-red-500" : engineReady ? "text-green-600" : ""}>{engineStatus}</b> | Side: {engineSide === "w" ? "Engine = White" : "Engine = Black"}
           </div>
+          {engineError && (
+            <div className="mb-2 text-xs text-red-500">
+              {engineError}
+            </div>
+          )}
           <div className="flex items-center gap-2 mb-2">
             <label className="text-sm">Engine side</label>
             <select
